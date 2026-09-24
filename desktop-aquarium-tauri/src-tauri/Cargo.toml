@@ -1,0 +1,19 @@
+[package]
+name = "desktop-aquarium"
+version = "1.0.0"
+description = "桌面鱼塘：透明覆盖在屏幕上的养鱼宠物"
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png", "macos-private-api"] }
+tauri-plugin-global-shortcut = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 2
+lto = true
+strip = true

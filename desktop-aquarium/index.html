@@ -1,0 +1,723 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>桌面鱼塘 · Desktop Aquarium</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #041e33; cursor: crosshair; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+const cv = document.getElementById("c");
+const ctx = cv.getContext("2d");
+let W = 0, H = 0;
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth; H = window.innerHeight;
+  cv.width = W * dpr; cv.height = H * dpr;
+  cv.style.width = W + "px"; cv.style.height = H + "px";
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener("resize", resize);
+resize();
+
+const TAU = Math.PI * 2;
+const rand = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const d2 = (ax, ay, bx, by) => { const x = ax - bx, y = ay - by; return x * x + y * y; };
+
+// ---------- 生态平衡参数 ----------
+const CFG = {
+  softCap: 42,        // 种群软上限：超过则停止繁殖
+  absCap: 80,         // 硬上限：绝不超生
+  fryGrowTime: 22,    // 小鱼长大所需秒数
+  breedSatiety: 60,   // 繁殖所需饱食度
+  breedCd: 22,        // 繁殖冷却（秒）
+  mateSeekR: 130,     // 寻找配偶的感知半径
+  foodRot: 40,        // 鱼食腐烂时间（秒）
+  foodMax: 45,        // 同屏鱼食上限
+  fleeR: 95,          // 鼠标惊吓半径
+  sharkFleeR: 190,    // 鲨鱼惊吓半径
+  senseR: 220,        // 食物感知半径
+  satietyDecay: 100 / 150, // 饱食度衰减（150秒饿到底）
+  starveTime: 12,     // 饿着多久会死
+  sharkLife: 20,      // 鲨鱼停留秒数
+  sharkMeals: 5,      // 鲨鱼吃够几条就走
+  sharkCd: 10,        // 鲨鱼召唤冷却
+  sharkMax: 2,        // 同屏鲨鱼上限
+};
+
+let fishes = [], foods = [], sharks = [], parts = [], seaweeds = [];
+let mouse = { x: -999, y: -999, speed: 0, down: false, lastT: 0 };
+let showHelp = true, paused = false, time = 0;
+let sharkCdT = 0, bubbleT = 0, lastFeedT = 0;
+const stats = { born: 0, eaten: 0, starved: 0, old: 0 };
+
+// ---------- 初始化 ----------
+function initSeaweed() {
+  seaweeds = [];
+  const n = Math.max(6, Math.floor(W / 160));
+  for (let i = 0; i < n; i++) {
+    seaweeds.push({
+      x: rand(30, W - 30), h: rand(50, 150),
+      amp: rand(6, 16), spd: rand(0.5, 1.1),
+      phase: rand(0, TAU), hue: rand(120, 170)
+    });
+  }
+}
+initSeaweed();
+
+function pickHue() {
+  const r = Math.random();
+  if (r < 0.35) return rand(10, 45);    // 橙黄系
+  if (r < 0.55) return rand(190, 225);  // 蓝系
+  if (r < 0.7) return rand(330, 360);   // 红系
+  return rand(0, 360);
+}
+function mixHue(a, b) {
+  let d = b - a;
+  if (d > 180) d -= 360;
+  if (d < -180) d += 360;
+  return (a + d / 2 + rand(-22, 22) + 360) % 360;
+}
+
+function makeFish(x, y, o) {
+  o = o || {};
+  const maxSize = o.maxSize || rand(17, 25);
+  return {
+    x: x, y: y, dir: rand(0, TAU),
+    baseSpeed: o.baseSpeed || rand(32, 48),
+    maxSize: maxSize,
+    size: o.fry ? 5 : maxSize,
+    hue: o.hue !== undefined ? o.hue : pickHue(),
+    sat: o.fry ? 60 : rand(50, 85),
+    sex: Math.random() < 0.5 ? "m" : "f",
+    age: o.fry ? 0 : rand(CFG.fryGrowTime, CFG.fryGrowTime + 30),
+    life: rand(150, 220),
+    breedCd: rand(4, 10),
+    panic: 0, starveT: 0,
+    tail: rand(0, TAU), wander: rand(0, TAU),
+    dead: false, eaten: false, deadT: 0
+  };
+}
+
+for (let i = 0; i < 8; i++) {
+  fishes.push(makeFish(rand(W * 0.2, W * 0.8), rand(H * 0.25, H * 0.75)));
+}
+
+// ---------- 粒子 ----------
+function addPart(p) { if (parts.length < 300) parts.push(p); }
+function bubbles(x, y, n) {
+  for (let i = 0; i < n; i++) {
+    addPart({ t: "b", x: x + rand(-6, 6), y: y + rand(-4, 4),
+      vx: rand(-6, 6), vy: rand(-34, -18), life: rand(0.8, 1.6), max: 1.6, r: rand(1, 3) });
+  }
+}
+function hearts(x, y) {
+  for (let i = 0; i < 5; i++) {
+    addPart({ t: "h", x: x + rand(-10, 10), y: y + rand(-6, 6),
+      vx: rand(-8, 8), vy: rand(-26, -14), life: rand(1, 1.6), max: 1.6, r: rand(3, 5.5) });
+  }
+}
+function crumbs(x, y) {
+  for (let i = 0; i < 6; i++) {
+    addPart({ t: "c", x: x, y: y, vx: rand(-22, 22), vy: rand(-16, 8),
+      life: rand(0.4, 0.9), max: 0.9, r: rand(1, 2) });
+  }
+}
+function blood(x, y) {
+  for (let i = 0; i < 12; i++) {
+    addPart({ t: "r", x: x, y: y, vx: rand(-50, 50), vy: rand(-50, 30),
+      life: rand(0.5, 1.1), max: 1.1, r: rand(1.5, 3.5) });
+  }
+}
+
+// ---------- 鱼食 ----------
+function dropFood(x, y) {
+  if (foods.length >= CFG.foodMax) return;
+  foods.push({ x: x + rand(-7, 7), y: y, vy: rand(14, 26),
+    rot: CFG.foodRot, r: rand(2.5, 3.6), sway: rand(0, TAU) });
+}
+
+// ---------- 鲨鱼 ----------
+function spawnShark(mx, my) {
+  if (sharks.length >= CFG.sharkMax || sharkCdT > 0) return;
+  sharkCdT = CFG.sharkCd;
+  // 从离点击位置最近的屏幕边缘入场
+  const dl = mx, dr = W - mx, dt2 = my, db = H - my;
+  const m = Math.min(dl, dr, dt2, db);
+  let x, y;
+  if (m === dl) { x = -70; y = clamp(my, 60, H - 60); }
+  else if (m === dr) { x = W + 70; y = clamp(my, 60, H - 60); }
+  else if (m === dt2) { x = clamp(mx, 60, W - 60); y = -70; }
+  else { x = clamp(mx, 60, W - 60); y = H + 70; }
+  sharks.push({
+    x: x, y: y, dir: Math.atan2(my - y, mx - x),
+    speed: rand(92, 112), size: rand(46, 58),
+    t: 0, meals: 0, state: "hunt", tail: 0, mouth: 0, exitDir: 0
+  });
+}
+
+// ---------- 行为辅助 ----------
+function nearestFood(f) {
+  let best = null, bd = Infinity;
+  for (const fd of foods) {
+    const d = d2(f.x, f.y, fd.x, fd.y);
+    if (d < bd) { bd = d; best = fd; }
+  }
+  return best ? { fd: best, d: bd } : null;
+}
+function nearestShark(f) {
+  let best = null, bd = Infinity;
+  for (const s of sharks) {
+    if (s.state !== "hunt") continue;
+    const d = d2(f.x, f.y, s.x, s.y);
+    if (d < bd) { bd = d; best = s; }
+  }
+  return best ? { s: best, d: bd } : null;
+}
+function findMate(f) {
+  let best = null, bd = Infinity;
+  for (const o of fishes) {
+    if (o === f || o.dead || o.sex === f.sex) continue;
+    if (o.age < CFG.fryGrowTime || o.sat < CFG.breedSatiety || o.breedCd > 0) continue;
+    const d = d2(f.x, f.y, o.x, o.y);
+    if (d < bd) { bd = d; best = o; }
+  }
+  return best ? { o: best, d: bd } : null;
+}
+function kill(f, cause) {
+  f.dead = true; f.deadT = 0;
+  if (stats[cause] !== undefined) stats[cause]++;
+  bubbles(f.x, f.y, 5);
+}
+function breed(a, b) {
+  if (fishes.length >= CFG.absCap) return;
+  a.breedCd = b.breedCd = CFG.breedCd;
+  a.sat -= 25; b.sat -= 25;
+  const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+  hearts(mx, my);
+  const n = Math.min(1 + Math.floor(Math.random() * 3), CFG.absCap - fishes.length);
+  for (let i = 0; i < n; i++) {
+    fishes.push(makeFish(mx + rand(-14, 14), my + rand(-10, 10), {
+      fry: true,
+      hue: mixHue(a.hue, b.hue),
+      maxSize: clamp((a.maxSize + b.maxSize) / 2 + rand(-2, 2), 14, 28),
+      baseSpeed: clamp((a.baseSpeed + b.baseSpeed) / 2 + rand(-5, 5), 26, 56)
+    }));
+    stats.born++;
+  }
+}
+
+// ---------- 更新 ----------
+function updFish(f, dt) {
+  if (f.dead) {
+    f.deadT += dt;
+    f.y -= 13 * dt;                     // 尸体上浮
+    f.x += Math.sin(time * 2 + f.tail) * 5 * dt;
+    return;
+  }
+  f.age += dt;
+  f.breedCd -= dt;
+  // 成长
+  const g = clamp(f.age / CFG.fryGrowTime, 0, 1);
+  f.size = 5 + (f.maxSize - 5) * g;
+  // 饥饿
+  f.sat -= CFG.satietyDecay * dt;
+  if (f.sat <= 0) {
+    f.sat = 0; f.starveT += dt;
+    if (f.starveT > CFG.starveTime) { kill(f, "starved"); return; }
+  } else f.starveT = 0;
+  // 寿终
+  if (f.age > f.life) { kill(f, "old"); return; }
+
+  const isAdult = f.age >= CFG.fryGrowTime;
+  const hungry = f.sat < 30;
+  let desired = null, spd = f.baseSpeed;
+
+  // 1) 躲鲨鱼（最高优先级）
+  const ns = nearestShark(f);
+  if (ns && ns.d < CFG.sharkFleeR * CFG.sharkFleeR) {
+    desired = Math.atan2(f.y - ns.s.y, f.x - ns.s.x);
+    spd = f.baseSpeed * 2.2;
+    f.panic = 1;
+  } else {
+    // 2) 躲鼠标（按住喂食时不躲；饿极了恐惧半径减半）
+    const fleeR = hungry ? CFG.fleeR * 0.5 : CFG.fleeR;
+    if (!mouse.down && mouse.speed > 80 && d2(f.x, f.y, mouse.x, mouse.y) < fleeR * fleeR) {
+      f.panic = 1;
+    }
+    if (f.panic > 0) {
+      desired = Math.atan2(f.y - mouse.y, f.x - mouse.x);
+      spd = f.baseSpeed * (1.6 + f.panic * 1.5);
+      f.panic -= dt * 0.7;
+    } else {
+      // 3) 找食物（越饿感知越远）
+      const nf = nearestFood(f);
+      const sense = CFG.senseR + (100 - f.sat) * 3;
+      if (nf && nf.d < sense * sense) {
+        desired = Math.atan2(nf.fd.y - f.y, nf.fd.x - f.x);
+        spd = f.baseSpeed * 1.55;
+        if (nf.d < (f.size + 8) * (f.size + 8)) {
+          nf.fd.rot = -1; // 吃掉
+          f.sat = clamp(f.sat + 38, 0, 100);
+          crumbs(nf.fd.x, nf.fd.y);
+        }
+      } else if (isAdult && f.sat > CFG.breedSatiety && f.breedCd <= 0 && fishes.length < CFG.softCap) {
+        // 4) 找对象
+        const nm = findMate(f);
+        if (nm && nm.d < CFG.mateSeekR * CFG.mateSeekR) {
+          desired = Math.atan2(nm.o.y - f.y, nm.o.x - f.x);
+          spd = f.baseSpeed * 1.25;
+          if (nm.d < 26 * 26) breed(f, nm.o);
+        }
+      }
+      if (desired === null) {
+        // 5) 闲逛
+        f.wander += rand(-1, 1) * 2.4 * dt;
+        desired = f.wander;
+        spd = f.baseSpeed * (0.7 + 0.3 * Math.sin(time * 0.7 + f.tail));
+      }
+    }
+  }
+
+  // 边缘排斥
+  let vx = Math.cos(desired), vy = Math.sin(desired);
+  const m = 70;
+  if (f.x < m) vx += (m - f.x) / m * 1.6;
+  if (f.x > W - m) vx -= (f.x - (W - m)) / m * 1.6;
+  if (f.y < m) vy += (m - f.y) / m * 1.6;
+  if (f.y > H - m) vy -= (f.y - (H - m)) / m * 1.6;
+  desired = Math.atan2(vy, vx);
+
+  // 平滑转向 + 移动
+  let da = ((desired - f.dir + Math.PI * 3) % TAU) - Math.PI;
+  f.dir += clamp(da, -3.4 * dt, 3.4 * dt);
+  f.x += Math.cos(f.dir) * spd * dt;
+  f.y += Math.sin(f.dir) * spd * dt;
+  f.x = clamp(f.x, 6, W - 6);
+  f.y = clamp(f.y, 6, H - 6);
+  f.tail += dt * (4 + spd * 0.12);
+}
+
+function updShark(s, dt) {
+  s.t += dt;
+  s.mouth = Math.max(0, s.mouth - dt * 3);
+  let desired = s.dir, spd = s.speed;
+
+  if (s.state === "hunt") {
+    if (s.t > CFG.sharkLife || s.meals >= CFG.sharkMeals) {
+      s.state = "leave";
+      // 朝最近的边缘游走
+      const dl = s.x, dr = W - s.x, du = s.y, db = H - s.y;
+      const m = Math.min(dl, dr, du, db);
+      s.exitDir = m === dl ? Math.PI : m === dr ? 0 : m === du ? -Math.PI / 2 : Math.PI / 2;
+    } else {
+      let best = null, bd = Infinity;
+      for (const f of fishes) {
+        if (f.dead) continue;
+        const dd = d2(s.x, s.y, f.x, f.y);
+        if (dd < bd) { bd = dd; best = f; }
+      }
+      if (best) {
+        desired = Math.atan2(best.y - s.y, best.x - s.x);
+        let mult = best.size > 14 ? 1.18 : 1.05;
+        if (bd < 130 * 130) mult += 0.4; // 近身猛冲
+        spd = s.speed * mult;
+        if (bd < 150 * 150) s.mouth = 1;
+        if (bd < (s.size * 0.55 + best.size * 0.4) * (s.size * 0.55 + best.size * 0.4)) {
+          best.dead = true; best.eaten = true;
+          s.meals++; stats.eaten++;
+          blood(best.x, best.y);
+          bubbles(best.x, best.y, 8);
+        }
+      } else {
+        desired = s.dir + Math.sin(s.t * 0.9) * 0.6;
+      }
+    }
+  } else {
+    desired = s.exitDir;
+    spd = s.speed * 1.25;
+  }
+
+  let da = ((desired - s.dir + Math.PI * 3) % TAU) - Math.PI;
+  s.dir += clamp(da, -3.1 * dt, 3.1 * dt);
+  s.x += Math.cos(s.dir) * spd * dt;
+  s.y += Math.sin(s.dir) * spd * dt;
+  s.tail += dt * 6;
+}
+
+function update(dt) {
+  sharkCdT = Math.max(0, sharkCdT - dt);
+  mouse.speed *= 0.92;
+
+  // 环境气泡
+  bubbleT -= dt;
+  if (bubbleT <= 0) {
+    bubbleT = rand(0.3, 0.9);
+    addPart({ t: "b", x: rand(0, W), y: H - 8,
+      vx: rand(-4, 4), vy: rand(-40, -22), life: rand(1.5, 3), max: 3, r: rand(1, 2.6) });
+  }
+
+  // 鱼食
+  for (const fd of foods) {
+    fd.rot -= dt;
+    if (fd.y < H - 10) {
+      fd.y += fd.vy * dt;
+      fd.x += Math.sin(time * 3 + fd.sway) * 8 * dt;
+    }
+  }
+  foods = foods.filter(f => f.rot > 0);
+
+  // 鱼
+  for (const f of fishes) updFish(f, dt);
+  // 简单分离，避免叠在一起
+  for (let i = 0; i < fishes.length; i++) {
+    const a = fishes[i];
+    if (a.dead) continue;
+    for (let j = i + 1; j < fishes.length; j++) {
+      const b = fishes[j];
+      if (b.dead) continue;
+      const rr = (a.size + b.size) * 0.5;
+      const dd = d2(a.x, a.y, b.x, b.y);
+      if (dd < rr * rr && dd > 0.01) {
+        const d = Math.sqrt(dd), push = (rr - d) / d * 14 * dt;
+        const px = (a.x - b.x) * push, py = (a.y - b.y) * push;
+        a.x += px; a.y += py; b.x -= px; b.y -= py;
+      }
+    }
+  }
+  fishes = fishes.filter(f => !(f.eaten || (f.dead && f.deadT > 4)));
+
+  // 鲨鱼
+  for (const s of sharks) updShark(s, dt);
+  sharks = sharks.filter(s =>
+    !(s.state === "leave" && (s.x < -110 || s.x > W + 110 || s.y < -110 || s.y > H + 110)));
+
+  // 粒子
+  for (const p of parts) {
+    p.life -= dt;
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    if (p.t === "b") p.x += Math.sin(time * 5 + p.y * 0.05) * 6 * dt;
+    if (p.t === "r") { p.vx *= 0.96; p.vy = p.vy * 0.96 - 12 * dt; }
+  }
+  parts = parts.filter(p => p.life > 0);
+}
+
+// ---------- 绘制 ----------
+function drawHeart(x, y, r, color, alpha) {
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.moveTo(x, y + r);
+  ctx.bezierCurveTo(x - r * 1.4, y - r * 0.2, x - r * 0.6, y - r * 1.2, x, y - r * 0.4);
+  ctx.bezierCurveTo(x + r * 0.6, y - r * 1.2, x + r * 1.4, y - r * 0.2, x, y + r);
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawFish(f) {
+  const s = f.size;
+  const wag = Math.sin(f.tail) * (f.dead ? 0.06 : 0.5);
+  ctx.save();
+  ctx.translate(f.x, f.y);
+  ctx.rotate(f.dir);
+  if (f.dead) {
+    ctx.scale(1, -1);
+    ctx.globalAlpha = Math.max(0, 1 - f.deadT / 4) * 0.75;
+  }
+  const hungry = f.sat < 30 && !f.dead;
+  const col = "hsl(" + f.hue + " " + (f.dead ? 18 : 70) + "% " + (f.dead ? 52 : hungry ? 44 : 56) + "%)";
+  const colD = "hsl(" + f.hue + " " + (f.dead ? 14 : 62) + "% " + (f.dead ? 40 : 40) + "%)";
+  // 尾巴
+  ctx.save();
+  ctx.translate(-s * 0.5, 0);
+  ctx.rotate(wag * 0.9);
+  ctx.fillStyle = colD;
+  ctx.beginPath();
+  ctx.moveTo(0, 0);
+  ctx.lineTo(-s * 0.62, -s * 0.4);
+  ctx.lineTo(-s * 0.5, 0);
+  ctx.lineTo(-s * 0.62, s * 0.4);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+  // 身体
+  ctx.fillStyle = col;
+  ctx.beginPath();
+  ctx.ellipse(0, 0, s * 0.58, s * 0.34, 0, 0, TAU);
+  ctx.fill();
+  // 肚皮
+  ctx.fillStyle = "hsla(" + f.hue + ", 60%, 82%, .5)";
+  ctx.beginPath();
+  ctx.ellipse(s * 0.05, s * 0.12, s * 0.4, s * 0.17, 0, 0, TAU);
+  ctx.fill();
+  // 背鳍
+  ctx.fillStyle = colD;
+  ctx.beginPath();
+  ctx.moveTo(-s * 0.12, -s * 0.28);
+  ctx.lineTo(s * 0.16, -s * 0.3);
+  ctx.lineTo(-s * 0.04, -s * 0.04);
+  ctx.closePath();
+  ctx.fill();
+  // 眼睛
+  if (!f.dead) {
+    ctx.fillStyle = "#fff";
+    ctx.beginPath(); ctx.arc(s * 0.32, -s * 0.08, s * 0.095, 0, TAU); ctx.fill();
+    ctx.fillStyle = "#101418";
+    ctx.beginPath(); ctx.arc(s * 0.35, -s * 0.08, s * 0.048, 0, TAU); ctx.fill();
+  } else {
+    ctx.strokeStyle = "#1c222a";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(s * 0.27, -s * 0.13); ctx.lineTo(s * 0.39, -s * 0.03);
+    ctx.moveTo(s * 0.39, -s * 0.13); ctx.lineTo(s * 0.27, -s * 0.03);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawShark(s) {
+  const L = s.size;
+  const wag = Math.sin(s.tail) * 0.4;
+  ctx.save();
+  ctx.translate(s.x, s.y);
+  ctx.rotate(s.dir);
+  // 尾鳍
+  ctx.save();
+  ctx.translate(-L * 0.5, 0);
+  ctx.rotate(wag);
+  ctx.fillStyle = "#46627a";
+  ctx.beginPath();
+  ctx.moveTo(0, 0);
+  ctx.lineTo(-L * 0.55, -L * 0.42);
+  ctx.lineTo(-L * 0.34, 0);
+  ctx.lineTo(-L * 0.55, L * 0.42);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+  // 身体
+  ctx.fillStyle = "#54708a";
+  ctx.beginPath();
+  ctx.ellipse(0, 0, L * 0.62, L * 0.26, 0, 0, TAU);
+  ctx.fill();
+  // 白肚皮
+  ctx.fillStyle = "#c8d6e2";
+  ctx.beginPath();
+  ctx.ellipse(L * 0.08, L * 0.1, L * 0.44, L * 0.13, 0, 0, TAU);
+  ctx.fill();
+  // 背鳍
+  ctx.fillStyle = "#46627a";
+  ctx.beginPath();
+  ctx.moveTo(-L * 0.06, -L * 0.2);
+  ctx.lineTo(L * 0.12, -L * 0.22);
+  ctx.lineTo(-L * 0.02, -L * 0.48);
+  ctx.closePath();
+  ctx.fill();
+  // 胸鳍
+  ctx.beginPath();
+  ctx.moveTo(L * 0.04, L * 0.16);
+  ctx.lineTo(L * 0.26, L * 0.18);
+  ctx.lineTo(L * 0.06, L * 0.4);
+  ctx.closePath();
+  ctx.fill();
+  // 鳃
+  ctx.strokeStyle = "rgba(0,0,0,.22)";
+  ctx.lineWidth = 1.2;
+  for (let i = 0; i < 3; i++) {
+    ctx.beginPath();
+    ctx.arc(L * (0.16 + i * 0.05), 0, L * 0.14, -1.1, 1.1);
+    ctx.stroke();
+  }
+  // 嘴（接近猎物时张开）
+  if (s.mouth > 0.05) {
+    ctx.fillStyle = "rgba(80,14,14," + (0.35 + s.mouth * 0.65) + ")";
+    ctx.beginPath();
+    ctx.moveTo(L * 0.62, 0);
+    ctx.lineTo(L * 0.3, -L * 0.02 - s.mouth * L * 0.12);
+    ctx.lineTo(L * 0.3, L * 0.02 + s.mouth * L * 0.12);
+    ctx.closePath();
+    ctx.fill();
+  }
+  // 眼睛
+  ctx.fillStyle = "#fff";
+  ctx.beginPath(); ctx.arc(L * 0.42, -L * 0.07, L * 0.05, 0, TAU); ctx.fill();
+  ctx.fillStyle = "#0b0e12";
+  ctx.beginPath(); ctx.arc(L * 0.44, -L * 0.07, L * 0.026, 0, TAU); ctx.fill();
+  ctx.restore();
+}
+
+function draw() {
+  // 水体背景
+  const bg = ctx.createLinearGradient(0, 0, 0, H);
+  bg.addColorStop(0, "#0a3d5c");
+  bg.addColorStop(1, "#041e33");
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, W, H);
+
+  // 光束
+  ctx.save();
+  for (let i = 0; i < 5; i++) {
+    const x = (i + 0.5) / 5 * W + Math.sin(time * 0.12 + i * 1.7) * 50;
+    ctx.fillStyle = "rgba(180,220,245,0.035)";
+    ctx.beginPath();
+    ctx.moveTo(x - 26, 0);
+    ctx.lineTo(x + 26, 0);
+    ctx.lineTo(x + 130, H);
+    ctx.lineTo(x + 40, H);
+    ctx.closePath();
+    ctx.fill();
+  }
+  ctx.restore();
+
+  // 海底
+  ctx.fillStyle = "#062238";
+  ctx.fillRect(0, H - 8, W, 8);
+
+  // 水草
+  ctx.lineCap = "round";
+  for (const w of seaweeds) {
+    ctx.strokeStyle = "hsl(" + w.hue + " 45% 30%)";
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.moveTo(w.x, H);
+    const segs = 4;
+    for (let i = 1; i <= segs; i++) {
+      const yy = H - w.h * i / segs;
+      const xx = w.x + Math.sin(time * w.spd + w.phase + i * 0.8) * w.amp * i / segs;
+      ctx.lineTo(xx, yy);
+    }
+    ctx.stroke();
+  }
+
+  // 鱼食
+  for (const fd of foods) {
+    const a = clamp(fd.rot / 6, 0, 1);
+    ctx.fillStyle = "rgba(214,164,90," + a + ")";
+    ctx.beginPath();
+    ctx.arc(fd.x, fd.y, fd.r, 0, TAU);
+    ctx.fill();
+    ctx.fillStyle = "rgba(240,200,130," + a * 0.8 + ")";
+    ctx.beginPath();
+    ctx.arc(fd.x - fd.r * 0.3, fd.y - fd.r * 0.3, fd.r * 0.4, 0, TAU);
+    ctx.fill();
+  }
+
+  // 鱼（先画死鱼，活鱼在上层）
+  for (const f of fishes) if (f.dead) drawFish(f);
+  for (const f of fishes) if (!f.dead) drawFish(f);
+
+  // 鲨鱼
+  for (const s of sharks) drawShark(s);
+
+  // 粒子
+  for (const p of parts) {
+    const a = clamp(p.life / p.max, 0, 1);
+    if (p.t === "b") {
+      ctx.strokeStyle = "rgba(190,225,245," + a * 0.7 + ")";
+      ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, TAU); ctx.stroke();
+    } else if (p.t === "h") {
+      drawHeart(p.x, p.y, p.r, "#ff6b8d", a);
+    } else if (p.t === "c") {
+      ctx.fillStyle = "rgba(214,164,90," + a + ")";
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, TAU); ctx.fill();
+    } else if (p.t === "r") {
+      ctx.fillStyle = "rgba(170,40,40," + a * 0.5 + ")";
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, TAU); ctx.fill();
+    }
+  }
+
+  // HUD
+  const alive = fishes.filter(f => !f.dead).length;
+  ctx.font = "13px -apple-system, 'PingFang SC', sans-serif";
+  ctx.fillStyle = "rgba(3,20,34,.55)";
+  ctx.beginPath(); ctx.roundRect(12, 12, 330, 30, 8); ctx.fill();
+  ctx.fillStyle = "#cfe8f5";
+  ctx.fillText("鱼 " + alive + " · 鱼食 " + foods.length + " · 鲨鱼 " + sharks.length +
+    " · 出生 " + stats.born + " · 被吃 " + stats.eaten + " · 死亡 " + (stats.starved + stats.old), 24, 31);
+
+  // 帮助
+  if (showHelp) {
+    const lines = [
+      "左键点击 / 按住拖动：撒鱼食，鱼会游过来抢",
+      "快速移动鼠标：吓跑附近的鱼（按住喂食时不会吓到）",
+      "右键：从最近的屏幕边缘召唤鲨鱼，吃几条后游走",
+      "吃饱的成年鱼会配对繁殖 · 一直不喂会饿死 · 鱼多会停止繁殖",
+      "H 隐藏帮助 · 空格 暂停"
+    ];
+    const bw = 500, bh = lines.length * 22 + 24;
+    const bx = (W - bw) / 2, by = H - bh - 24;
+    ctx.fillStyle = "rgba(3,20,34,.62)";
+    ctx.beginPath(); ctx.roundRect(bx, by, bw, bh, 12); ctx.fill();
+    ctx.fillStyle = "#dceefb";
+    lines.forEach((t, i) => ctx.fillText(t, bx + 20, by + 28 + i * 22));
+  }
+
+  if (paused) {
+    ctx.font = "20px -apple-system, 'PingFang SC', sans-serif";
+    ctx.fillStyle = "rgba(220,238,251,.8)";
+    ctx.fillText("已暂停（空格继续）", W / 2 - 90, 60);
+  }
+}
+
+// ---------- 输入 ----------
+cv.addEventListener("mousedown", e => {
+  if (e.button === 0) {
+    mouse.down = true;
+    dropFood(e.clientX, e.clientY);
+    lastFeedT = time;
+  }
+});
+window.addEventListener("mouseup", () => { mouse.down = false; });
+cv.addEventListener("mousemove", e => {
+  const now = performance.now();
+  if (mouse.lastT) {
+    const dt = Math.max(1, now - mouse.lastT) / 1000;
+    const dd = Math.hypot(e.clientX - mouse.x, e.clientY - mouse.y);
+    mouse.speed = Math.max(mouse.speed, dd / dt);
+  }
+  mouse.lastT = now;
+  mouse.x = e.clientX; mouse.y = e.clientY;
+  // 按住拖动连续撒食
+  if (mouse.down && time - lastFeedT > 0.09) {
+    dropFood(e.clientX, e.clientY);
+    lastFeedT = time;
+  }
+});
+cv.addEventListener("contextmenu", e => {
+  e.preventDefault();
+  if (!paused) spawnShark(e.clientX, e.clientY);
+});
+window.addEventListener("keydown", e => {
+  if (e.code === "KeyH") showHelp = !showHelp;
+  if (e.code === "Space") { paused = !paused; e.preventDefault(); }
+});
+// 触屏支持
+cv.addEventListener("touchstart", e => {
+  const t = e.touches[0];
+  mouse.x = t.clientX; mouse.y = t.clientY;
+  dropFood(t.clientX, t.clientY);
+  e.preventDefault();
+}, { passive: false });
+
+// ---------- 主循环 ----------
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  if (!paused) { time += dt; update(dt); }
+  draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

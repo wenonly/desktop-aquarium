@@ -1,0 +1,34 @@
+{
+  "name": "desktop-aquarium",
+  "version": "1.0.0",
+  "description": "桌面鱼塘：透明覆盖在屏幕上的养鱼宠物（繁殖/喂食/鼠标惊吓/鲨鱼天敌），Windows/macOS/Linux",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "pack:mac": "electron-builder --mac",
+    "pack:win": "electron-builder --win",
+    "pack:linux": "electron-builder --linux"
+  },
+  "devDependencies": {
+    "electron": "^33.4.11"
+  },
+  "build": {
+    "appId": "com.local.desktop-aquarium",
+    "productName": "桌面鱼塘",
+    "files": [
+      "main.js",
+      "preload.js",
+      "renderer/**",
+      "assets/**"
+    ],
+    "mac": {
+      "category": "public.app-category.entertainment"
+    },
+    "win": {
+      "target": "nsis"
+    },
+    "linux": {
+      "target": "AppImage"
+    }
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "name": "desktop-aquarium-tauri",
+  "version": "1.0.0",
+  "private": true,
+  "description": "桌面鱼塘（Tauri 版）：透明覆盖在屏幕上的养鱼宠物，Windows/macOS/Linux",
+  "scripts": {
+    "dev": "tauri dev",
+    "build": "tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}
